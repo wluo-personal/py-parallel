@@ -1,11 +1,13 @@
 import time
 from multiprocessing import Manager, Process
-import subprocess
 import queue
 import ctypes
 import gc
-import psutil
 from py_parallel.status import Status
+from py_parallel.utils import (
+    Process as util_process,
+    Queue as util_queue
+)
 from py_parallel.lock import CrossProcessLock
 import logging
 
@@ -20,7 +22,6 @@ args, otherwise, you may have some issue like process 'stopped exitcode=-SIGSEGV
 stopped exitcode=-SIGABRT Fix Solution:
 new process to do th spawn. -- use Array to save pid
 
-typecode: https://docs.python.org/3.5/library/array.html
 
 """
 
@@ -30,10 +31,23 @@ class DelayedExecutor:
         This DelayedExecutor can execute task in new process and the result of
         the task will be saved in a queue. If the size of the queue reaches a
         certain threshold, it stops execute the tasks, until the queue get
-        smaller. This is to protect the memory consumption.
+        smaller. This is to prevent the memory exhaustion.
         Usage case: CV DNN related realtime image augment + DNN training.
+
+        The result sequence may not be the same as the order you add tasks
+
         :param n_cpus: number of cpus(hyper-threads)
         :param result_capacity: the threshold of the q
+
+        methods:
+         - run
+         - add_task
+         - get_result
+         - get_result_queue_size
+         - get_all_process_status
+         - close
+         - get_all_process_status
+
         """
         self.n_cpus_ = n_cpus
         self.result_capacity_ = result_capacity
@@ -58,6 +72,7 @@ class DelayedExecutor:
         self._q_task_ = Manager().Queue()
         self._q_task_buffer_ = Manager().Queue()
         self._q_result_ = Manager().Queue()
+        # typecode: https://docs.python.org/3.5/library/array.html
         self._process_ids_ = Manager().Array(typecode="l", sequence=[0] * self.n_cpus_)
         self._buffer_credit_ = Manager().Value(
             ctypes.c_long, self.result_capacity_)
@@ -93,18 +108,21 @@ class DelayedExecutor:
         """
         while not EXIT.value:
             time.sleep(self._sleep_)
-            with CrossProcessLock.lock(self._lock):
-                remain = buffer_credit.value
+            remain = buffer_credit.value
+            if remain > 0:
                 n_added = 0
-                for _ in range(remain):
-                    try:
-                        task = q_task_.get(block=False)
-                        q_task_buffer.put(task)
-                        n_added += 1
-                    except queue.Empty:
-                        break
-                if n_added > 0:
-                    buffer_credit.value -= n_added
+                with CrossProcessLock.lock(self._lock):
+                    remain = buffer_credit.value
+                    # get tasks
+                    for _ in range(remain):
+                        try:
+                            task = q_task_.get(block=False)
+                            q_task_buffer.put(task)
+                            n_added += 1
+                        except queue.Empty:
+                            break
+                    if n_added > 0:
+                        buffer_credit.value -= n_added
 
     def _worker_manager(
             self,
@@ -128,16 +146,26 @@ class DelayedExecutor:
                     array_pid[process_index] = pid
                 else:
                     # check process status
-                    if not self.is_process_healthy(pid):
+                    if not util_process.is_process_healthy(pid):
                         logging.error(f"The process index: {process_index}, "
                                       f"pid: {pid} is unhealthy. "
                                       f"Start a new process")
                         try:
-                            self._soft_kill_a_process(pid)
+                            util_process.kill_process_soft(pid)
                         except Exception:
                             pass
-                        self._force_kill_a_process(pid)
+                        util_process.kill_process_force(pid)
                         array_pid[process_index] = 0
+
+        # exit condition
+        for process_index in range(self.n_cpus_):
+            pid = array_pid[process_index]
+            try:
+                util_process.kill_process_soft(pid)
+            except Exception:
+                pass
+            util_process.kill_process_force(pid)
+
 
 
 
@@ -158,7 +186,14 @@ class DelayedExecutor:
                     continue
                 func, kwargs = task
                 array_status[process_index] = Status.busy
-                q_result.put(func(**kwargs))
+                try:
+                    r = func(**kwargs)
+                except Exception as e:
+                    self.EXIT.set(True)
+                    logging.error("Encounter error in worker. Stopping all workers.")
+                    logging.exception(e)
+                    raise e
+                q_result.put(r)
         finally:
             logging.debug(f"process index: {process_index} exit.")
             array_status[process_index] = Status.terminated
@@ -184,6 +219,10 @@ class DelayedExecutor:
         return status
 
     def get_result(self):
+        """
+        Get result. It's non-block and the user needs to handle potential exceptions.
+        :return:
+        """
         res = self._q_result_.get(block=False)
         with CrossProcessLock.lock(self._lock):
             self._buffer_credit_.value += 1
@@ -194,76 +233,44 @@ class DelayedExecutor:
 
 
     def close(self):
+        """
+        release all resources
+        :return:
+        """
         self.EXIT.set(True)
 
-        # # 1. softkill
-        # for process in self.processes_:
-        #     self._soft_kill_a_process(process=process)
-        # self._soft_kill_a_process(process=self.process_task_producer_)
-        #
-        # # 2. hardkill
-        # for process in self.processes_:
-        #     self._force_kill_a_process(process=process)
-        # self._force_kill_a_process(process=self.process_task_producer_)
-        #
-        # # 3. destroy queues
-        # self.empty_a_queue(self._q_task_buffer_)
-        # self.empty_a_queue(self._q_result_)
-        # self.empty_a_queue(self._q_task_)
-        # del self._q_task_buffer_
-        # del self._q_result_
-        # del self._q_task_
-        # del self._lock
-        #
-        # # 4. destroy status
-        # # del self._process_status_
-        #
-        # gc.collect()
-
-
-
-    def _soft_kill_a_process(self, process: Process or psutil.Process or int):
-        if isinstance(process, Process):
-            process.kill()
-        else:
-            if not isinstance(process, psutil.Process):
-                try:
-                    process = psutil.Process(process)
-                except psutil.NoSuchProcess:
-                    return
-            process.kill()
-
-
-
-    def _force_kill_a_process(self, process: Process or int):
-        if isinstance(process, Process):
-            if process.is_alive():
-                pid = process.pid
-                if pid is not None:
-                        subprocess.run(["kill", "-9", f"{pid}"])
-        else:
-            pid = process
-            subprocess.run(["kill", "-9", f"{pid}"])
-
-    def empty_a_queue(self, q: Manager().Queue):
-        while q.qsize() > 0:
+        # 1. kill workers
+        for idx in range(len(self._process_ids_)):
+            pid = self._process_ids_[idx]
             try:
-                q.get(block=False)
-            except queue.Empty:
-                break
+                util_process.kill_process_soft(pid)
+            except Exception:
+                pass
+            util_process.kill_process_force(pid)
 
-    @staticmethod
-    def is_process_healthy(process: int or psutil.Process):
-        if isinstance(process, int):
-            try:
-                process = psutil.Process(process)
-            except psutil.NoSuchProcess:
-                return False
+        # 2. kill worker manager
+        util_process.kill_process_soft(self.process_worker_manager_)
+        util_process.kill_process_force(self.process_worker_manager_)
 
-        if process.status() in Status.unhealthy_status:
-            return False
-        else:
-            return True
+        # 3. kill task manager
+        util_process.kill_process_soft(self.process_task_producer_)
+        util_process.kill_process_force(self.process_task_producer_)
+
+        # 4. destroy queues
+        util_queue.empty_a_queue(self._q_task_buffer_)
+        util_queue.empty_a_queue(self._q_result_)
+        util_queue.empty_a_queue(self._q_task_)
+        del self._q_task_buffer_
+        del self._q_result_
+        del self._q_task_
+        del self._lock
+        del self._process_ids_
+        del self._buffer_credit_
+        del self._process_status_
+
+        gc.collect()
+
+
 
 
 
