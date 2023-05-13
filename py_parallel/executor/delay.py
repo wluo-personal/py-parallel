@@ -47,6 +47,7 @@ class DelayedExecutor:
          - get_all_process_status
          - close
          - get_all_process_status
+         - get_worker_pids
 
         """
         self.n_cpus_ = n_cpus
@@ -230,6 +231,10 @@ class DelayedExecutor:
 
     def get_result_queue_size(self):
         return self._q_result_.qsize()
+
+    def get_worker_pids(self):
+        return list(self._process_ids_[:])
+
 
 
     def close(self):
