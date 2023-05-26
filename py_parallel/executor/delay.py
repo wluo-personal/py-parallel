@@ -26,7 +26,7 @@ new process to do th spawn. -- use Array to save pid
 """
 
 class DelayedExecutor:
-    def __init__(self, n_cpus=1, result_capacity=5000):
+    def __init__(self, n_cpus=1, result_capacity=5000, global_res_q=None):
         """
         This DelayedExecutor can execute task in new process and the result of
         the task will be saved in a queue. If the size of the queue reaches a
@@ -38,6 +38,10 @@ class DelayedExecutor:
 
         :param n_cpus: number of cpus(hyper-threads)
         :param result_capacity: the threshold of the q
+        :param global_res_q: the Manager().Queue() or None.
+            If specified, will use this instead of create a new one.
+            This is to make sure the Queue is created as global queue that
+            can be shared across all process
 
         methods:
          - run
@@ -52,6 +56,7 @@ class DelayedExecutor:
         """
         self.n_cpus_ = n_cpus
         self.result_capacity_ = result_capacity
+        self.global_res_q_ = global_res_q
         self.EXIT = Manager().Value(ctypes.c_bool, value=False)
         self._sleep_ = 1e-3
         self._lock = Manager().Value(ctypes.c_bool, False)
@@ -72,7 +77,10 @@ class DelayedExecutor:
         """
         self._q_task_ = Manager().Queue()
         self._q_task_buffer_ = Manager().Queue()
-        self._q_result_ = Manager().Queue()
+        if self.global_res_q_ is not None:
+            self._q_result_ = self.global_res_q_
+        else:
+            self._q_result_ = Manager().Queue()
         # typecode: https://docs.python.org/3.5/library/array.html
         self._process_ids_ = Manager().Array(typecode="l", sequence=[0] * self.n_cpus_)
         self._buffer_credit_ = Manager().Value(
@@ -266,7 +274,8 @@ class DelayedExecutor:
         util_queue.empty_a_queue(self._q_result_)
         util_queue.empty_a_queue(self._q_task_)
         del self._q_task_buffer_
-        del self._q_result_
+        if self.global_res_q_ is None:
+            del self._q_result_
         del self._q_task_
         del self._lock
         del self._process_ids_
